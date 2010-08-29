@@ -463,11 +463,312 @@ sub op_get_next_prop {
 }
 
 
+sub op_get_parent {
+	my ($opcode, $store, $obj) = @_;
+
+	my $p_obj = arg2p($obj);
+	my $a_obj = get_object($p_obj);
+
+	my $p_parent;
+
+	if($header{version} <= 3){
+		$p_parent = $mem[$a_obj + 4];
+	} else {
+		$p_parent = get_word($a_obj + 6);
+	}
+
+	write_var($store, $p_parent);
+}
+
+
+sub op_get_prop {
+	my ($opcode, $store, $obj, $propnum) = @_;
+	my $p_obj = arg2p($obj);
+	my $p_propnum = arg2p($propnum);
+
+	my $a_obj = get_object($p_obj);
+	my $prop  = get_prop($a_obj, $p_propnum, 1);
+
+	my $value;
+	if($prop->{size} == 1) {
+		$value = $mem[$prop->{data}];
+	} elsif ($prop->{size} == 2 {
+		$value = get_word($prop->{data});
+	} else {
+		die "get_prop called on property with length > 2";
+	}
+
+	write_var($store, $value);
+}
+
+
+sub op_get_prop_addr {
+	my ($opcode, $store, $obj, $propnum) = @_;
+	
+	my $prop = args2prop($obj, $propnum, 0);
+
+	if(defined($prop)){
+		write_var($store, $prop->{data});
+	} else {
+		write_var($store, 0);
+	}
+}
+
+sub op_get_prop_len {
+	my ($opcode, $store, $obj, $propnum) = @_;
+	
+	my $prop = args2prop($obj, $propnum, 0);
+
+	if(defined($prop)){
+		write_var($store, $prop->{size});
+	} else {
+		die "Attempt to get_prop_len on object without requested property.";
+	}
+}
+
+sub op_get_sibling {
+	my ($opcode, $store, $branch_on, $branch_offset, $obj) = @_;
+
+	my $a_obj = args2obj($obj);
+
+	my $p_sibling;
+	if($header{version} <= 3){
+		$p_sibling = $mem[$a_obj + 5];
+	} else {
+		$p_sibling = get_word($a_obj + 8);
+	}
+
+	if($p_sibling == $branch_on) {
+		branch($branch_offset);
+	}
+}
+
+
+sub op_inc {
+	my ($opcode, $var) = @_;
+
+	my $p_var = arg2p($var);
+
+	my $value = from_signed(read_var($p_var));
+	write_var($value+1);
+}
+
+sub op_inc_chk {
+	my ($opcode, $branch_on, $branch_offset, $var, $above) = @_;
+
+	my $p_var = arg2p($var);
+	my $p_above = arg2p_s($var);
+
+	my $value = from_signed(read_value($p_var));
+	$value--;
+	write_value($p_var, $value);
+
+	if(!!$branch_on == ($value > $above)){
+		branch($branch_offset);
+	}
+}
+
+
+sub op_input_stream {
+	die "input_stream not implemented yet";
+}
+
+sub op_insert_obj {
+	my ($opcode, $obj, $dest) = @_;
+
+	my $p_obj = arg2p($obj);
+	my $p_dest = arg2p($dest);
+
+	# detach the moving object from its current location
+	remove_object($p_obj);
+
+	# and attach it to the new destination
+	my $child = get_child($p_dest);
+	set_child($p_dest, $p_obj);
+	set_parent($p_obj, $p_dest);
+	set_sibling($p_obj, $child);
+}
+
+
+sub op_je {
+	jump(sub { my ($a, $b) = @_; $a == $b }, @_);
+}
+sub op_jg {
+	jump(sub { my ($a, $b) = @_; $a > $b }, @_);
+}
+sub op_jl {
+	jump(sub { my ($a, $b) = @_; $a < $b }, @_);
+}
+
+sub op_jin {
+	my ($opcode, $branch_on, $branch_offset, $a, $b) = @_;
+
+	my $p_a = arg2p($a);
+	my $p_b = arg2p($b);
+
+	if(!!$branch_on == (get_parent($p_a) == $p_b)) {
+		branch($branch_offset);
+	}
+}
+
+sub op_jump {
+	my ($opcode, $address) = @_;
+
+	$pc = arg2p($address);
+}
+
+sub op_jz {
+	my ($opcode, $branch_on, $branch_offset, $a) = @_;
+	my $p_a = arg2p($a);
+
+	if(!!$branch_on == ($p_a == 0)){
+		branch($branch_offset);
+	}
+}
+
+
+sub op_load {
+	my ($opcode, $store, $source) = @_;
+	my $p_source = arg2p($source);
+
+	write_var($store, read_var($p_source));
+}
+
+sub op_loadb {
+	my ($opcode, $store, $array, $index) = @_;
+	my $p_array = arg2p($array);
+	my $p_index = arg2p($index);
+
+	write_var($store, $mem[$p_array + $p_index]);
+}
+
+sub op_loadw {
+	my ($opcode, $store, $array, $index) = @_;
+	my $p_array = arg2p($array);
+	my $p_index = arg2p($index);
+
+	write_var($store, get_word($p_array + 2*$p_index));
+}
+
+
 
 
 #################################################################
 # objects and properties
 #################################################################
+
+# complex operation to detach an object from the tree and give it parent 0.
+# it keeps its children, and is removed neatly
+# object /number/, not address
+sub remove_object {
+	my ($obj) = @_;
+	# so this is complex as fuck:
+	# * go up to parent
+	# * go down to child at the head of the linked list of siblings
+	# * walk down, remembering the previous as well as current
+	# * stop on reaching this object, then set the previous one's sibling to this one's sibling
+	# * now set the parent of this one to 0
+
+	my $parent = get_parent($obj);
+	my $prev = 0;
+	my $child = get_child($parent);
+
+	# special case for being the first child
+	if($child == $obj){
+		set_child($parent, get_sibling($obj));
+		set_parent($obj, 0);
+		return;
+	}
+
+	do {
+		$prev = $child;
+		$child = get_sibling($child);
+	} until ($child == $obj);
+
+	set_sibling($prev, get_sibling($child));
+	set_parent($obj, 0);
+}
+
+
+# helper function for one of the common patterns
+# takes an object number in argument form and return the byte address of the object
+sub args2obj {
+	my ($obj) = @_;
+	my $p_obj = arg2p($obj);
+	return get_object($p_obj);
+}
+
+# helper function for one of the common patterns
+# takes an object number and a property number in argument form, plus the default flag, and returns the prop object or undef
+sub args2prop {
+	my ($obj, $num, $default) = @_;
+	my $p_obj = arg2p($obj);
+	my $p_num = arg2p($num);
+
+	my $a_obj = get_object($p_obj);
+	return get_prop($a_obj, $p_num, $default);
+}
+
+
+# given the address of an object, returns the number of its parent
+sub get_parent {
+	my ($obj) = @_;
+	
+	return get_related_obj($obj, 0);
+}
+
+sub get_sibling {
+	my ($obj) = @_;
+	return get_related_obj($obj, 1);
+}
+
+sub get_child {
+	my ($obj) = @_;
+	return get_related_obj($obj, 2);
+}
+
+sub get_related_obj {
+	my ($obj, $index) = @_;
+
+	my $a_obj = get_object($obj);
+	my $related;
+	if($header{version} <= 3) {
+		$related = $mem[$a_obj + 4 + $index];
+	} else {
+		$related = get_word($a_obj + 6 + 2*$index);
+	}
+
+	return $related;
+}
+
+# given the address of an object and the number of another, changes the first to point to the second
+sub set_parent {
+	my ($obj, $to) = @_;
+	
+	set_related_obj($obj, 0, $to);
+}
+
+sub set_sibling {
+	my ($obj, $to) = @_;
+	set_related_obj($obj, 1, $to);
+}
+
+sub set_child {
+	my ($obj, $to) = @_;
+	set_related_obj($obj, 2, $to);
+}
+
+sub set_related_obj {
+	my ($obj, $index, $to) = @_;
+
+	my $a_obj = get_object($obj);
+	if($header{version} <= 3) {
+		$mem[$a_obj + 4 + $index] = $to;
+	} else {
+		set_word($a_obj + 6 + 2*$index, $to);
+	}
+}
+
 
 # takes an object number, returns the address of the object's fields
 sub get_object {
@@ -527,8 +828,34 @@ sub build_prop {
 # there is an optional third argument that chooses whether to use the default if not found. defaults to 1. returns undef otherwise.
 sub get_prop {
 	my ($a_obj, $number, $default) = @_;
+	$default = 1 unless defined($default);
 
 	my $a_prop = get_word($a_obj  + ($header{version} <= 3 ? 7 : 12));
+
+	my $prop = build_prop($a_prop);
+	# properties are stored in descending numerical order
+	while($prop && $prop->{number} && $prop->{number} > $number){
+		$prop = build_prop($prop->{next});
+	}
+
+	# now that it's done, there are several possibilities for what we've found:
+	if($prop->{number} == $number) { # found it
+		return $prop;
+	} elsif($prop->{number} < $number) { # passed without finding it
+		if($default){
+			# the defaults are stored in the header of the object tree
+			$prop = { number => $number, next => undef, data => $header{objects} + ($number-1)*2, size => 2 };
+			return $prop;
+		} else {
+			return undef;
+		}
+	}
+}
+
+
+
+
+
 
 
 
@@ -543,6 +870,18 @@ sub get_prop {
 # instruction utilities
 #################################################################
 
+# takes a sub ref followed by normal op arguments
+sub jump {
+	my ($test, $opcode, $branch_on, $branch_offset, $a, $b) = @_;
+
+	my $p_a = arg2p_s($a);
+	my $p_b = arg2p_s($b);
+
+	my $result = $test->($p_a, $p_b);
+	if(!!$result == !!$branch_on){
+		branch($branch_offset);
+	}
+}
 
 # returns the number of characters per dictionary entry
 sub dictionary_length {
