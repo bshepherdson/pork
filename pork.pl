@@ -90,6 +90,8 @@ cbreak();
 noecho();
 nonl();
 
+# seed with the time, initially
+srand();
 
 # load up the story file
 read_story_file($ARGV[0]);
@@ -651,6 +653,251 @@ sub op_loadw {
 }
 
 
+sub op_log_shift {
+	my ($opcode, $store, $num, $places) = @_;
+	my $p_num = arg2p($num);
+	my $p_places = arg2p($places);
+
+	$p_num = ($places < 0 ? $p_num >> -$places : $p_num << $places);
+	write_var($store, $p_num);
+}
+
+
+sub op_mod {
+	my ($opcode, $store, $a, $b) = @_;
+	my $p_a = arg2p_s($a);
+	my $p_b = arg2p_s($b);
+
+	if($p_b == 0){
+		die "Attempt to mod by 0.";
+	}
+
+	write_var($store, $p_a % $p_b);
+}
+
+sub op_mul {
+	my ($opcode, $store, $a, $b) = @_;
+	my $p_a = arg2p_s($a);
+	my $p_b = arg2p_s($b);
+
+	write_var($store, $p_a * $p_b);
+}
+
+sub op_new_line {
+	my ($opcode) = @_;
+
+	print_perl_str("\n");
+}
+
+sub op_nop {
+	# do nothing
+}
+
+sub op_not {
+	my ($opcode, $store, $value) = @_;
+	my $p_value = arg2p($value);
+
+	write_var($store, (~$p_value) & 0xffff);
+}
+
+sub op_or {
+	my ($opcode, $store, $a, $b) = @_;
+	my $p_a = arg2p($a);
+	my $p_b = arg2p($b);
+
+	write_var($store, $a | $b);
+}
+
+sub op_output_stream {
+	die "output_stream infiltrated";
+}
+
+sub op_piracy {
+	my ($opcode, $branch_on, $branch_offset) = @_;
+
+	branch($branch_offset);
+}
+
+sub op_pop {
+	pop_stack();
+}
+
+
+sub op_print {
+	my ($opcode) = @_;
+
+	print_literal_string();
+}
+
+sub op_print_addr {
+	my ($opcode, $addr) = @_;
+	my $p_addr = arg2p($addr);
+
+	print_perl_str(decode_str($addr));
+}
+
+sub op_print_char {
+	my ($opcode, $char) = @_;
+	my $p_char = arg2p($char);
+
+	print_perl_str(zscii_chr($p_char));
+}
+
+
+sub op_print_obj {
+	my ($opcode, $obj) = @_;
+
+	print_object($obj);
+}
+
+sub op_print_paddr {
+	my ($opcode, $addr) = @_;
+
+	my $pa = arg2p($addr);
+	print_perl_string(decode_str(unpack_addr($pa)));
+}
+
+sub op_print_ret {
+	my ($opcode) = @_;
+
+	print_literal_str();
+
+	return_(1);
+}
+
+
+sub op_print_table {
+	die "print_table is not implemented";
+}
+
+sub op_print_unicode {
+	die "print_unicode is not implemented";
+}
+
+sub op_pull {
+	my ($opcode, $var) = @_;
+
+	my $p_var = arg2p($var);
+	my $value = pop_stack();
+	write_var($p_var, $value);
+}
+
+sub op_push {
+	my ($opcode, $value) = @_;
+	my $p_value = arg2p($value);
+
+	push_stack($p_value);
+}
+
+sub op_put_prop {
+	my ($opcode, $obj, $prop, $value) = @_;
+	my $p_value = arg2p($value);
+
+	my $prop = args2prop($obj, $prop, 0);
+
+	die "put_prop: property not defined" unless defined($prop);
+
+	if($prop->{size} > 2) {
+		die "put_prop: property is larger than 2 bytes";
+	} elsif($prop->{size} == 2) {
+		set_word($prop->{data}, $p_value);
+	} elsif($prop->{size} == 1) {
+		$mem[ $prop->{data} ] = 0xff & $p_value;
+	}
+}
+
+sub op_quit {
+	my ($opcode) = @_;
+
+	$quit = 1; # the main loop will quit on the next pass
+}
+
+sub op_random {
+	my ($opcode, $store, $range) = @_;
+	my $p_range = arg2p_s($range);
+
+	my $ret = 0;
+	if($p_range < 0) {
+		srand($p_range);
+	} elsif($p_range > 0) {
+		$ret = int(rand($p_range))+1;
+	} else {
+		srand(); # re-seed using the time/pid/etc.
+	}
+
+	write_var($store, $ret);
+}
+
+sub op_read {
+	die "read is not implemented";
+}
+
+sub op_read_char {
+	die "read_char is not implemented";
+}
+
+sub op_remove_obj {
+	my ($opcode, $obj) = @_;
+
+	my $p_obj = arg2p($obj);
+	remove_object($p_obj);
+}
+
+sub op_restart {
+	die "restart not implemented";
+}
+
+sub op_restore {
+	die "restore not implemented";
+}
+
+sub op_restore_undo {
+	die "restore_undo not implemented";
+}
+
+sub op_ret {
+	my ($opcode, $value) = @_;
+	my $p_value = arg2p($value);
+
+	return_($p_value);
+}
+
+sub op_ret_popped {
+	my ($opcode) = @_;
+
+	my $val = pop_stack();
+	return_($val);
+}
+
+sub op_rfalse {
+	my ($opcode) = @_;
+	return_(0);
+}
+
+sub op_rtrue {
+	my ($opcode) = @_;
+	return_(1);
+}
+
+sub op_save {
+	die "save not implemented";
+}
+
+sub op_save_undo {
+	die "save_undo not implemented";
+}
+
+sub op_scan_table {
+	die "scan_table is not implemented";
+}
+
+
+
+
+
+
+
+
 
 
 #################################################################
@@ -869,6 +1116,20 @@ sub get_prop {
 #################################################################
 # instruction utilities
 #################################################################
+
+
+
+sub print_literal_str {
+	my $str = decode_str($pc);
+	print_perl_str($str);
+
+	# now move pc
+	while(!bit( get_word($pc), 15)){ 
+		$pc += 2;
+	}
+	$pc += 2;
+}
+
 
 # takes a sub ref followed by normal op arguments
 sub jump {
