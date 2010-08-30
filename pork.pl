@@ -3,6 +3,7 @@
 use strict;
 use warnings;
 use integer; # force integer operations
+use feature "switch"; # access Perl 6 given/when syntax
 
 use Curses;
 
@@ -36,16 +37,14 @@ my @alphabets = ( [ undef, undef, undef, undef, undef, undef, 'a'..'z' ],
 				  '.', ',', '!', '?', '_', '#', '\'', '"', 
 				  '/', '\\', '-', ':', '(', ')' ] );
 
-my %alphabet_table = qw( a 6 b 7 c 8 d 9 e 10 f 11 g  12 h 13 i 14 j 15 k 16 l 17 m 18 n 19 o 20 p 21 q 22 r 23 s 24 t 25 u 26 v 27 w 28 x 29 y 30 z 31
- A 38 B 39 C 40 D 41 E 42 F 43 G 44 H 45 I 46 J 47 K 48 L 49 M 50 N 51 O 52 P 53 Q 54 R 55 S 56 T 57 U 58 V 59 W 60 X 61 Y 62 Z 63 0 72 1 73 2 74 3 75 4 76 5 77 6 78 7 79 8 80 9 81 ),
- ( ' ' => 0, "\n" => 71, '.' => 82, ',' => 83, '!' => 84, '?' => 85, '_' => 86, '#' => 87, "'" => 88, '"' => 89, '/' => 90, "\\" => 91, '-' => 92, ':' => 93, '(' => 94, ')' => 95 );
+my %alphabet_table = ( qw( a 6 b 7 c 8 d 9 e 10 f 11 g 12 h 13 i 14 j 15 k 16 l 17 m 18 n 19 o 20 p 21 q 22 r 23 s 24 t 25 u 26 v 27 w 28 x 29 y 30 z 31 A 38 B 39 C 40 D 41 E 42 F 43 G 44 H 45 I 46 J 47 K 48 L 49 M 50 N 51 O 52 P 53 Q 54 R 55 S 56 T 57 U 58 V 59 W 60 X 61 Y 62 Z 63 0 72 1 73 2 74 3 75 4 76 5 77 6 78 7 79 8 80 9 81 ),
+ ( ' ' => 0, "\n" => 71, '.' => 82, ',' => 83, '!' => 84, '?' => 85, '_' => 86, '#' => 87, "'" => 88, '"' => 89, '/' => 90, "\\" => 91, '-' => 92, ':' => 93, '(' => 94, ')' => 95 ) );
 
 
 # these opcode names are not the same as in the spec tables, it's TYPE:HEX rather than TYPE:WHOLE_BYTE
 # WARNING: use lowercase hex, as that's how it's printed by (s)printf's %x
 my %store_opcodes;
-for(qw( 2OP:8 2OP:9, 2OP:f ), map { "2OP:" . $_ } (10..19), qw( 1OP:1 1OP:2 1OP:3 1OP:4 1OP:8 1OP:e 1OP:f),
-	qw(VAR:0 VAR:7 VAR:c VAR:16 VAR:17 VAR:18 EXT:0 EXT:1 EXT:2 EXT:3 EXT:4 EXT:9 EXT:a EXT:13) ){
+for(qw( 2OP:8 2OP:9 2OP:f 2OP:10 2OP:11 2OP:12 2OP:13 2OP:14 2OP:15 2OP:16 2OP:17 2OP:18 2OP:19 1OP:1 1OP:2 1OP:3 1OP:4 1OP:8 1OP:e 1OP:f VAR:0 VAR:7 VAR:c VAR:16 VAR:17 VAR:18 EXT:0 EXT:1 EXT:2 EXT:3 EXT:4 EXT:9 EXT:a EXT:13) ){
 	$store_opcodes{$_}++;
 }
 
@@ -64,7 +63,7 @@ my @mem; # main memory
 my @stack; # the Z-machine user stack
 my $sp;    # stack pointer for the user stack
 
-# format of the routine stack: { sp ($#stack at the time of the call), return (next instruction to execute on return), locals (array of local variables, 0 is a dummy) }
+# format of the routine stack: { sp ($#stack at the time of the call), return_addr (next instruction to execute on return), return_dest (variable to store the return value in, -1 for nowhere), locals (array of local variables, 0 is a dummy) }
 my @routine_stack; # the interpreter's routine state stack, holding return addresses and local variables, plus the stack pointer at the start of the routine
 my $rsp = -1; # gives the active index of the ROUTINE stack -- points at, rather than above, the top of the stack
 my $pc; # the program counter
@@ -89,6 +88,8 @@ initscr();
 cbreak();
 noecho();
 nonl();
+
+my $main_window;
 
 # seed with the time, initially
 srand();
@@ -285,8 +286,11 @@ sub op_pop__catch {
 	if($header{version} >= 5) { # catch
 		my ($opcode, $store) = @_;
 		write_var($store, $rsp);
+	} else { # pop
+		pop_stack();
 	}
 }
+
 
 sub op_check_arg_count {
 	my ($opcode, $branch_on, $branch_offset, $number) = @_;
@@ -303,10 +307,12 @@ sub op_check_arg_count {
 
 sub op_clear_attr {
 	my ($opcode, $object, $attr) = @_;
-	imp_change_attr($object, $attr, 0);
+	imp_handle_attr($object, $attr, 0);
 }
 
-sub imp_change_attr {
+# hacky code to handle object attributes
+# if $to is 1, attr is set. if 0, attr is cleared. if -1, attr value is returned
+sub imp_handle_attr {
 	my ($object, $attr, $to) = @_;
 	my $p_object = arg2p($object);
 	my $p_attr   = arg2p($attr);
@@ -320,10 +326,12 @@ sub imp_change_attr {
 	$attr = $bits - $attr - 1;
 	my $bit  = $attr % 8;
 
-	if($to){
+	if($to == 1){
 		set_bit($mem[$obj+$byte], $bit);
-	} else {
+	} elsif($to == 0) {
 		clear_bit($mem[$obj+$byte], $bit);
+	} elsif($to == -1) {
+		return bit($mem[$obj+$byte], $bit);
 	}
 }
 
@@ -332,7 +340,7 @@ sub imp_change_attr {
 # I assume these are not Z-machine tables per se, just arrays, and that $p_size is a number of bytes to be blindly copied
 sub op_copy_table {
 	my ($opcode, $first, $second, $size) = @_;
-	my ($p_first, $p_second) = map arg2p ($first, $second);
+	my ($p_first, $p_second) = map { arg2p($_) } ($first, $second);
 	my $p_size = arg2p_s($size);
 
 	if($p_second == 0) {
@@ -371,7 +379,7 @@ sub op_dec {
 sub op_dec_chk {
 	my ($opcode, $branch_on, $branch_offset, $var, $below) = @_;
 
-	my $p_var = arg2p($p_var);
+	my $p_var = arg2p($var);
 	my $p_below = arg2p_s($below);
 
 	my $p_value = from_signed(read_var($p_var));
@@ -397,7 +405,7 @@ sub op_div {
 
 sub op_encode_text {
 	my $opcode = shift;
-	my ($p_zscii_text, $p_length, $p_from, $p_dest) = map arg2p @_;
+	my ($p_zscii_text, $p_length, $p_from, $p_dest) = map { arg2p($_) } @_;
 
 	my @chars;
 	for(my $i = $p_from; $i < $p_from+$p_length; $i++) {
@@ -494,7 +502,7 @@ sub op_get_prop {
 	my $value;
 	if($prop->{size} == 1) {
 		$value = $mem[$prop->{data}];
-	} elsif ($prop->{size} == 2 {
+	} elsif ($prop->{size} == 2) {
 		$value = get_word($prop->{data});
 	} else {
 		die "get_prop called on property with length > 2";
@@ -718,10 +726,6 @@ sub op_piracy {
 	branch($branch_offset);
 }
 
-sub op_pop {
-	pop_stack();
-}
-
 
 sub op_print {
 	my ($opcode) = @_;
@@ -790,10 +794,10 @@ sub op_push {
 }
 
 sub op_put_prop {
-	my ($opcode, $obj, $prop, $value) = @_;
+	my ($opcode, $obj, $propnum, $value) = @_;
 	my $p_value = arg2p($value);
 
-	my $prop = args2prop($obj, $prop, 0);
+	my $prop = args2prop($obj, $propnum, 0);
 
 	die "put_prop: property not defined" unless defined($prop);
 
@@ -892,11 +896,135 @@ sub op_scan_table {
 }
 
 
+sub op_set_attr {
+	my ($opcode, $object, $attr) = @_;
+	imp_handle_attr($object, $attr, 1);
+}
+
+sub op_set_colour {
+	die "set_colour is not implemented";
+}
+
+sub op_set_cursor {
+	die "set_cursor is not implemented";
+}
+
+sub op_set_font {
+	die "set_font is not implemented";
+}
+
+sub op_set_text_style {
+	die "set_text_style is not implemented";
+}
+
+sub op_set_window {
+	die "set_window is not implemented";
+}
+
+sub op_show_status {
+	my ($opcode) = @_;
+
+	if($header{version} == 3) { # version 3 only
+		update_status_line();
+	} else { # nop in later versions, Wishbringer v5 r23 contains it by accident
+		# nop
+	}
+}
+
+sub op_sound_effect {
+	die "sound_effect is not implemented";
+}
+
+sub op_split_window { 
+	die "split_window is not implemented";
+}
 
 
+sub op_store {
+	my ($opcode, $var, $value) = @_;
+
+	my $p_var = arg2p($var);
+	my $p_value = arg2p($value);
+
+	write_var($p_var, $p_value);
+}
+
+sub op_storeb {
+	my ($opcode, $array, $index, $value) = @_;
+	my $p_array = arg2p($array);
+	my $p_index = arg2p($index);
+	my $p_value = arg2p($value);
+
+	$mem[$p_array + $p_index] = 0xff & $p_value;
+}
+
+sub op_storew {
+	my ($opcode, $array, $index, $value) = @_;
+	my $p_array = arg2p($array);
+	my $p_index = arg2p($index);
+	my $p_value = arg2p($value);
+
+	set_word($p_array + 2*$p_index, $value);
+}
 
 
+sub op_sub {
+	my ($opcode, $store, $a, $b) = @_;
+	my $p_a = arg2p_s($a);
+	my $p_b = arg2p_s($b);
 
+	write_var($store, $p_a - $p_b);
+}
+
+sub op_test {
+	my ($opcode, $branch_on, $branch_offset, $bitmap, $flags) = @_;
+	my $p_bitmap = arg2p($bitmap);
+	my $p_flags  = arg2p($flags);
+
+	if($branch_on == (($p_bitmap & $p_flags) == $p_flags)) {
+		branch($branch_offset);
+	}
+}
+
+
+sub op_test_attr {
+	my ($opcode, $branch_on, $branch_offset, $obj, $attr) = @_;
+	
+	my $value = imp_handle_attr($obj, $attr, -1);
+
+	if($branch_on == $value) {
+		branch($branch_offset);
+	}
+}
+
+
+sub op_throw {
+	my ($opcode, $value, $frame) = @_;
+	my $p_value = arg2p($value);
+	my $p_frame = arg2p($frame);
+
+	# move the rsp
+	$rsp = $p_frame;
+	# and then return
+	return_($p_value);
+}
+
+
+sub tokenise {
+	die "tokenise is not implemented";
+	#my ($opcode, $text, $parse, $dictionary, $flag) = @_;
+}
+
+
+# just a nop for now, assumes the checksums pass
+# TODO: actually implement the checksums
+sub verify {
+	my ($opcode, $branch_on, $branch_offset) = @_;
+
+	if($branch_on){
+		branch($branch_offset);
+	}
+}
 
 
 
@@ -1118,6 +1246,27 @@ sub get_prop {
 #################################################################
 
 
+sub return_ {
+	my ($ret_val) = @_;
+
+	my $state = $routine_stack[$rsp];
+
+	# move the stack pointer
+	$sp = $state->{sp};
+	# and the pc
+	$pc = $state->{return_addr};
+
+	# now move $rsp down so store_var will use the return target's locals rather than mine
+	$rsp--;
+	
+	# delete locals so they get garbage-collected
+	$state->{locals} = undef;
+
+	if($state->{return_dest} >= 0) {
+		store_var($state->{return_dest}, $ret_val);
+	}
+}
+
 
 sub print_literal_str {
 	my $str = decode_str($pc);
@@ -1199,6 +1348,7 @@ sub arg2p {
 
 sub arg2p_s {
 	my ($arg) = @_;
+	my ($type, $value) = @$arg;
 	
 	given($type){
 		when(0) { return from_signed($value); }
@@ -1266,7 +1416,13 @@ sub decode_instr {
 
 			my $op_bytes = ( $opcode == 12 || $opcode == 26 ) ? 2 : 1;
 
-			my @raw_op_types =  $op_bytes == 2 ? @mem[$a+1, $a+2] : @mem[$a+1]; # two bytes for call_vs2 and call_vn2, one otherwise
+			my @raw_op_types;
+			if($op_bytes == 2){
+				push @raw_op_types, @mem[$a+1, $a+2];
+			} else {
+				push @raw_op_types, $mem[$a+1];
+			}
+
 			for(@raw_op_types){
 				push @op_types, bits($_, 6,7), bits($_, 4,5), bits($_, 2,3), bits($_, 0,1);
 			}
@@ -1319,18 +1475,18 @@ sub decode_instr {
 	}
 
 	# build the interpreter-internal opcode, eg; 2OP:165
-	my $interp_opcode = sprintf("%s:%x", $interp_type, $opcode);
+	my $interp_opcode = sprintf("%s:%x", $instr_type, $opcode);
 
 	# "store" instructions require one byte given the variable number to store the result
 	my $store = -1;
-	if(exists($store_ops{$interp_opcode})){
+	if(exists($store_opcodes{$interp_opcode})){
 		$store = $mem[$a_ops++]; # get that last byte, and move $a_ops to the instruction after
 	}
 
 	my $f_branch = 0;
 	my $branch_on;
 	my $branch_offset;
-	if(exists($branch_ops{$interp_opcode})) {
+	if(exists($branch_opcodes{$interp_opcode})) {
 		$f_branch = 1;
 
 		my $b = $mem[$a_ops];
@@ -1385,13 +1541,13 @@ sub bit {
 sub set_bit {
 	my ($v, $n) = @_;
 
-	@_[0] = $v | (1 << $n);
+	$_[0] = $v | (1 << $n);
 }
 
 sub clear_bit {
 	my ($v, $n) = @_;
 
-	@_[0] = $v & ~(1 << $n);
+	$_[0] = $v & ~(1 << $n);
 }
 
 
@@ -1408,7 +1564,7 @@ sub bits {
     $v &= $mask;
 
     while(!bit($v, 0)){
-        $v >> 1;
+        $v >>= 1;
     }
 }
 
@@ -1443,6 +1599,7 @@ sub decode_str {
 	}
 
 	my $str = '';
+	my $alpha = 0;
 
 	for(my $i = 0; $i < @c; $i++) {
 		given($c[$i]) {
@@ -1500,7 +1657,7 @@ sub encode_str {
 
 	# if length is set, we're encoding for the dictionary, so it needs to be lowercased
 	if($length) {
-		@chars = map lc @chars;
+		@chars = map { lc } @chars;
 	}
 
 	my @enc_chars;
@@ -1632,7 +1789,7 @@ sub set_word { # unsigned. truncates to 16-bit values
 sub to_word {
 	my $sw = shift;
 
-	$sw = $sw < 0 ? $NEGATOR - $sw : $sw);
+	$sw = ($sw < 0 ? $NEGATOR - $sw : $sw);
 
 	return $sw % 0x1_0000;
 }
@@ -1704,8 +1861,8 @@ sub initialize_opcodes {
 		"0OP:b"   => \&op_new_line,
 		"0OP:c"   => \&op_show_status,
 		"0OP:d"   => \&op_verify,
-		"0OP:e"   => sub { unimp("extended", @_); }
-		"0OP:f"   => sub { unimp("piracy", @_); }
+		"0OP:e"   => sub { unimp("extended", @_); },
+		"0OP:f"   => sub { unimp("piracy", @_); },
 
 		"VAR:0"   => \&op_call_s,
 		"VAR:1"   => \&op_storew,
@@ -1717,18 +1874,18 @@ sub initialize_opcodes {
 		"VAR:7"   => \&op_random,
 		"VAR:8"   => \&op_push,
 		"VAR:9"   => \&op_pull,
-		"VAR:a"   => sub { unimp("split_window", @_); }
-		"VAR:b"   => sub { unimp("set_window", @_); }
+		"VAR:a"   => sub { unimp("split_window", @_); },
+		"VAR:b"   => sub { unimp("set_window", @_); },
 		"VAR:c"   => \&op_call_s,
-		"VAR:d"   => sub { unimp("erase_window", @_); }
+		"VAR:d"   => sub { unimp("erase_window", @_); },
 		"VAR:e"   => \&op_erase_line,
 		"VAR:f"   => \&op_set_cursor,
-		"VAR:10"  => sub { unimp("get_cursor_array", @_); }
+		"VAR:10"  => sub { unimp("get_cursor_array", @_); },
 		"VAR:11"  => \&op_set_text_style,
 		"VAR:12"  => \&op_buffer_mode,
 		"VAR:13"  => \&op_output_stream,
 		"VAR:14"  => \&op_input_stream,
-		"VAR:15"  => sub { unimp("sound_effect", @_); }
+		"VAR:15"  => sub { unimp("sound_effect", @_); },
 		"VAR:16"  => \&op_read_char,
 		"VAR:17"  => \&op_scan_table,
 		"VAR:18"  => \&op_not,
@@ -1738,7 +1895,7 @@ sub initialize_opcodes {
 		"VAR:1c"  => \&op_encode_text,
 		"VAR:1d"  => \&op_copy_table,
 		"VAR:1e"  => \&op_print_table,
-		"VAR:1f"  => \&op_check_arg_count
+		"VAR:1f"  => \&op_check_arg_count,
 
 		"EXT:0"   => \&op_save,
 		"EXT:1"   => \&op_restore,
@@ -1747,7 +1904,7 @@ sub initialize_opcodes {
 		"EXT:4"   => \&op_set_font,
 		"EXT:9"   => \&op_save_undo,
 		"EXT:a"   => \&op_restore_undo,
-		"EXT:b"   => sub { unimp("print_unicode", @_); }
+		"EXT:b"   => sub { unimp("print_unicode", @_); },
 		"EXT:c"   => sub { unimp("check_unicode", @_); }
 	);
 
