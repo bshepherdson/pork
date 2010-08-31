@@ -89,7 +89,16 @@ cbreak();
 noecho();
 nonl();
 
-my $main_window;
+# set up the windows: a one-liner at the top and a main window
+my ($rows, $cols);
+getmaxyx(stdscr, $rows, $cols);
+my $status_line = newwin(1, $cols, 0, 0);
+my $main_window = newwin($rows-1, $cols, 1, 0);
+
+scrollok($main_window, 1);
+
+cursor_to_bottom();
+
 
 # seed with the time, initially
 srand();
@@ -184,12 +193,56 @@ sub read_story_file {
 
 	# these two instructions are Store in 5+
 	if($header{version} >= 5) {
-		$store_opcodes{"0OP:9"}++;
-		$store_opcodes{"VAR:4"}++;
+		$store_opcodes{"0OP:9"}++; # catch
+		$store_opcodes{"VAR:4"}++; # read
 	}
 
 }
 
+
+#################################################################
+# curses and screens
+#################################################################
+
+sub cursor_to_bottom {
+	move($main_window, $rows-2, 0);
+}
+
+# takes a maximum number of characters and whether to read a whole line (1) or just one character (0)
+# returns what the user typed either way
+sub read_mode {
+	my ($max, $line) = @_;
+
+	if($line) {
+		my $str = "";
+		while(1) {
+			my $c = getch($main_window);
+
+			if(ord($c) == 127) { # backspace
+				chop($str);
+				my ($r,$c);
+				getyx($main_window, $r, $c);
+				addch($main_window, $r, $c-1, " ");
+				move($main_window, $r, $c-1);
+				refresh($main_window);
+			} elsif($c eq "\r") { # newline
+				scroll($main_window);
+				move($main_window, $rows-2, 0);
+				break;
+			} else {
+				if(length($str) < $max){
+					addch($main_window, $c);
+					$str .= $c;
+				}
+			}
+		}
+
+		return $str;
+	} else { # single character
+		my $c = getch($main_window);
+		return $c;
+	}
+}
 
 
 #################################################################
@@ -832,9 +885,154 @@ sub op_random {
 	write_var($store, $ret);
 }
 
+# TODO: Implement the timeout functionality -- right now it's ignored
 sub op_read {
-	die "read is not implemented";
+	my ($opcode, $store, $text, $parse, $time, $routine);
+	if($header{version} <= 3) {
+		($opcode, $text, $parse) = @_;
+	} elsif($header{version} == 4) {
+		($opcode, $text, $parse, $time, $routine) = @_;
+	} else { # 5 and up
+		($opcode, $store, $text, $parse, $time, $routine) = @_;
+	}
+
+	if($header{version} <= 3) {
+		update_status_line();
+	}
+
+	my $a_text = arg2p($text);
+	my $max_chars;
+	my $a_chars; # address where characters go
+
+	# in version 5 and later, byte 1 contains the number of characters typed so far
+	if($header{version} >= 5){
+		$max_chars = $mem[$a_text] - $mem[$a_text+1];
+		$a_chars = $a_text + 2 + $mem[$a_text+1]; # skipping over any text already present
+	} else {
+		$max_chars = $mem[$a_text] - 1; # "minus 1" in the spec... not clear. erring on the side of not overflowing
+		$a_chars = $a_text+1;
+	}
+
+	# read a whole line, with a maximum of $max_chars characters of input
+	my $str = read_mode($max_chars, 1);
+	$str = lc $str; # force it to lowercase
+
+	# copy it into the text buffer starting at $a_chars;
+	my @chars = split //, $str;
+	for my $i (0..$#chars) {
+		$mem[$a_chars + $i] = zscii_ord($chars[$i]);
+	}
+
+	# set the length byte in V5+
+	if($header{version} >= 5) {
+		$mem[$a_text+1] += scalar(@chars);
+	} else { # and in lower versions, write the 0 byte at the end
+		$mem[$a_text+scalar(@chars)] = 0;
+	}
+
+	# and now the lexing and matching
+	my $a_parse = arg2p($parse);
+	if($header{version} < 5 || $a_parse > 0) { # version 5+ can skip parsing if a_parse is 0
+		my $max_words = $mem[$a_parse];
+
+		my $a_dict_hdr = $header{dictionary};
+
+		my $num_seps = $mem[$a_dict_hdr];
+		my @word_seps = map { zscii_chr($_) } @mem[$a_dict_hdr+1..$a_dict_hdr+$num_seps];
+
+		my @words;
+		my @chars = split //, $str;
+
+		my $buf = '';
+		my $start = 0;
+		for my $i (0..$#chars) {
+			given($chars[$i]) {
+				when( [ ' ', @word_seps ] ) {
+					if($buf ne '') {
+						push @words, [ $start, $buf, length($buf) ];
+						$buf = '';
+					}
+
+					if($_ ne ' ') {
+						push @words, [ $i, $_, 1 ];
+					}
+				}
+				default {
+					$start = $i if $buf eq ''; # move start if this is the first letter of the word
+					$buf .= $_;
+				}
+			}
+		}
+		push @words, $buf unless $buf eq '';
+
+		
+		# now begin searching the dictionary for the words.
+		my $entry_len = $mem[$a_dict_hdr + $num_seps + 1]; # in bytes
+		my $num_entries = get_word($a_dict_hdr + $num_seps + 2);
+		my $a_first = $a_dict_hdr + $num_seps + 4; # skip over: n, n seps, 1 byte and 1 word
+
+		my @words_parsed;
+		my $wpw = $header{version} >= 4 ? 3 : 2; # "words per word"
+
+
+		for(@words) {
+			my @enc = encode_str($_->[1]);
+
+			my $ix_left = 0;
+			my $ix_right = $num_entries - 1;
+
+			my $found = 0;
+			my $dir = 0;
+			while(!$found) {
+				my $ix_mid = ($ix_right - $ix_left)/2;
+				my $a_mid = $a_first + $entry_len * $ix_mid;
+
+				# compare with mid
+				for(my $i = 0; $i < $wpw; $i++){
+					given($enc[$i] <=> get_word($a_mid + $i*2)) {
+						when(-1) { # enc word comes before this one
+							$ix_right = $ix_mid;
+						}
+						when(1)  { # enc word comes after this one
+							$ix_left = $ix_mid;
+						}
+						when(0) { # matches
+							if($i == $wpw-1) { # found it exactly
+								push @words_parsed, [ $a_mid, $_->[2], $_->[0] ]; # address, length, location in command
+								$found = 1;
+							} # otherwise check the next word too
+						}
+					}
+				}
+			}
+		}
+
+		# now we have the list of parsed words in @words_parsed
+		# so write them into the buffer
+
+		$max_words = $mem[$a_parse];
+		my $words_written = 0;
+		for($words_written = 0; $words_written < $max_words && $words_written < @words_parsed; $words_written++) {
+
+			my $w = $words_parsed[$words_written];
+			my $a = $a_parse + 1 + 4*$words_written;
+			set_word($a, $w->[0]); # write the address
+			$mem[$a+1] = $w->[1];  # write the number of letters
+			$mem[$a+2] = $w->[2];  # and the location in the text
+		}
+
+
+		$mem[$a_parse] = $words_written;
+
+
+		if($header{version} >= 5) {
+			write_var($store, 10); # write a terminator of 10 (newline) into the buffer
+			# TODO: That won't always be true once interrupts are on. and there's something in v5 about different EOL characters?
+		}
+
+	}
 }
+
 
 sub op_read_char {
 	die "read_char is not implemented";
